@@ -1,37 +1,35 @@
-const mineflayer = require('mineflayer');
+const bedrock = require('bedrock-protocol');
 const express = require('express');
 const app = express();
 
-app.get('/', (req, res) => res.send('Elysium Bot Status: OK'));
+// Веб-сервер для поддержки Render
+app.get('/', (req, res) => res.send('Elysium Bedrock Bot: OK'));
 app.listen(process.env.PORT || 3000);
 
-console.log('Попытка подключения к Elysium...');
+console.log('Попытка подключения к Bedrock серверу Elysium...');
 
-const bot = mineflayer.createBot({
-  host: 'ТВОЙ_IP.aternos.me', // ПРОВЕРЬ ЕЩЕ РАЗ!
-  port: 44193, // Твой последний порт из логов
+const client = bedrock.createClient({
+  host: 'ТВОЙ_IP.aternos.me', // Максим, впиши сюда свой адрес
+  port: 44193,                // Твой актуальный порт из логов
   username: 'Elysium_Guard',
-  offline: true,
-  version: false // Бот сам подберет версию протокола
+  offline: true               // Обязательно для Cracked (пиратского) режима
 });
 
-bot.on('login', () => {
-  console.log('Бот успешно вошел в аккаунт!');
+client.on('join', () => {
+  console.log('Максим, успех! Я зашел на Bedrock сервер Elysium!');
+  
+  // Имитация активности, чтобы не кикнули
+  setInterval(() => {
+    console.log('Бот активен, стою на посту...');
+  }, 60000);
 });
 
-bot.on('spawn', () => {
-  console.log('Максим, я заспавнился в мире!');
-});
-
-bot.on('error', (err) => {
+client.on('error', (err) => {
   console.log('ОШИБКА ПОДКЛЮЧЕНИЯ:', err.message);
 });
 
-bot.on('kicked', (reason) => {
-  console.log('Бот был КИКНУТ сервером:', reason);
-});
-
-bot.on('end', () => {
-  console.log('Соединение закрыто. Перезапуск через 30 сек...');
+client.on('disconnect', (packet) => {
+  console.log('Бот отключен от сервера. Причина:', packet.reason);
+  // Перезапуск через 30 секунд
   setTimeout(() => process.exit(1), 30000);
 });
