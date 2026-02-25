@@ -8,7 +8,7 @@ app.listen(process.env.PORT || 3000);
 
 const bot = mineflayer.createBot({
   host: 'ТВОЙ_IP.aternos.me', // Максим, тут впиши свой адрес еще раз
-  port: 19132,
+  port: 44193,
   username: 'Elysium_Guard',
   offline: true,
   version: '1.21.1' // Оставляем именно так, это "общая" версия для 1.21
