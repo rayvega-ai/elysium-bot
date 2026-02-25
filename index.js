@@ -28,7 +28,7 @@ const client = bedrock.createClient({
   port: SERVER_PORT,
   username: BOT_NAME,
   offline: true,
-  version: '1.21.131'
+  version: '1.21.124'
 });
 
 // ===== Успешное подключение =====
