@@ -9,7 +9,7 @@ app.listen(process.env.PORT || 3000);
 console.log('Попытка подключения к Bedrock серверу Elysium...');
 
 const client = bedrock.createClient({
-  host: 'ТВОЙ_IP.aternos.me', // Максим, впиши сюда свой адрес
+  host: 'Elysium-62TP.aternos.me', // Максим, впиши сюда свой адрес
   port: 44193,                // Твой актуальный порт из логов
   username: 'Elysium_Guard',
   offline: true               // Обязательно для Cracked (пиратского) режима
