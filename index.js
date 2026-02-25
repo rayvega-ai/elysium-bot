@@ -1,35 +1,58 @@
+'use strict';
+
 const bedrock = require('bedrock-protocol');
 const express = require('express');
+
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Веб-сервер для поддержки Render
-app.get('/', (req, res) => res.send('Elysium Bedrock Bot: OK'));
-app.listen(process.env.PORT || 3000);
-
-console.log('Попытка подключения к Bedrock серверу Elysium...');
-
-const client = bedrock.createClient({
-  host: 'Elysium-62TP.aternos.me', // Максим, впиши сюда свой адрес
-  port: 44193,                // Твой актуальный порт из логов
-  username: 'Elysium_Guard',
-  offline: true               // Обязательно для Cracked (пиратского) режима
+// ===== Express (обязательно для Render) =====
+app.get('/', (req, res) => {
+  res.send('Bedrock bot is running');
 });
 
-client.on('join', () => {
-  console.log('Максим, успех! Я зашел на Bedrock сервер Elysium!');
-  
-  // Имитация активности, чтобы не кикнули
+app.listen(PORT, () => {
+  console.log('Web server started on port', PORT);
+});
+
+// ===== ДАННЫЕ ТВОЕГО СЕРВЕРА =====
+const SERVER_HOST = 'Elysium-62TP.aternos.me';
+const SERVER_PORT = 44193;
+const BOT_NAME = 'Elysium_Guard';
+
+// ===== Подключение =====
+console.log('Connecting to Bedrock server...');
+
+const client = bedrock.createClient({
+  host: SERVER_HOST,
+  port: SERVER_PORT,
+  username: BOT_NAME,
+  offline: true,
+  version: '1.21.131'
+});
+
+// ===== Успешное подключение =====
+client.on('spawn', () => {
+  console.log('Bot successfully joined the server');
+
+  // Каждую минуту лог активности
   setInterval(() => {
-    console.log('Бот активен, стою на посту...');
+    console.log('Bot is alive:', new Date().toISOString());
   }, 60000);
 });
 
+// ===== Ошибки =====
 client.on('error', (err) => {
-  console.log('ОШИБКА ПОДКЛЮЧЕНИЯ:', err.message);
+  console.log('Connection error:', err.message);
+  process.exit(1); // Render перезапустит
 });
 
 client.on('disconnect', (packet) => {
-  console.log('Бот отключен от сервера. Причина:', packet.reason);
-  // Перезапуск через 30 секунд
-  setTimeout(() => process.exit(1), 30000);
+  console.log('Disconnected:', packet?.reason || packet);
+  process.exit(1);
+});
+
+client.on('end', () => {
+  console.log('Connection ended');
+  process.exit(1);
 });
