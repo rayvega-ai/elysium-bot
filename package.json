@@ -1,7 +1,6 @@
 {
   "name": "bedrock-render-bot",
   "version": "1.0.0",
-  "description": "Minecraft Bedrock bot for Render",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
