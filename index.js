@@ -7,7 +7,12 @@ const express = require('express');
 const APP_PORT = process.env.PORT || 3000;
 const MC_HOST = (process.env.MC_HOST || '').trim();
 const MC_PORT = process.env.MC_PORT ? Number(process.env.MC_PORT) : NaN;
-const BOT_NAME = process.env.BOT_NAME || 'BedrockBot';
+
+// Optional: base name (you can set BOT_NAME_BASE in env), and add suffix if ENABLE_NAME_SUFFIX != 'false'
+const BOT_NAME_BASE = process.env.BOT_NAME_BASE || process.env.BOT_NAME || 'BedrockBot';
+const ENABLE_NAME_SUFFIX = (process.env.ENABLE_NAME_SUFFIX || 'true').toLowerCase() !== 'false';
+const BOT_NAME = ENABLE_NAME_SUFFIX ? `${BOT_NAME_BASE}_${Math.floor(Math.random() * 9000 + 1000)}` : BOT_NAME_BASE;
+
 const RECONNECT_MODE = (process.env.RECONNECT_MODE || 'retry').toLowerCase();
 const RETRY_INTERVAL_MS = process.env.RETRY_INTERVAL_MS ? Number(process.env.RETRY_INTERVAL_MS) : 30000;
 const KEEPALIVE_MS = 60_000;
@@ -16,8 +21,8 @@ const KEEPALIVE_MS = 60_000;
 const RECONNECT_DELAY_MS = process.env.RECONNECT_DELAY_MS ? Number(process.env.RECONNECT_DELAY_MS) : 60000;
 const PATROL_STEP_SEC_MIN = process.env.PATROL_STEP_SEC_MIN ? Number(process.env.PATROL_STEP_SEC_MIN) : 3;
 const PATROL_STEP_SEC_MAX = process.env.PATROL_STEP_SEC_MAX ? Number(process.env.PATROL_STEP_SEC_MAX) : 6;
-const PATROL_TURN_SEC_MIN = 15;
-const PATROL_TURN_SEC_MAX = 30;
+const PATROL_TURN_SEC_MIN = process.env.PATROL_TURN_SEC_MIN ? Number(process.env.PATROL_TURN_SEC_MIN) : 15;
+const PATROL_TURN_SEC_MAX = process.env.PATROL_TURN_SEC_MAX ? Number(process.env.PATROL_TURN_SEC_MAX) : 30;
 const CHAT_INTERVAL_MS = process.env.CHAT_INTERVAL_MS
   ? Number(process.env.CHAT_INTERVAL_MS)
   : (180_000 + Math.floor(Math.random() * 120_000)); // 3–5 min default
@@ -45,12 +50,14 @@ const app = express();
 app.get('/', (req, res) => res.send('Bedrock bot: OK'));
 app.listen(APP_PORT, () => console.log(`Express started on port ${APP_PORT}`));
 
+/* ---------------- STATE ---------------- */
 let client = null;
 let keepAliveTimer = null;
 let reconnectTimer = null;
 let tryingIndex = 0;
+let reconnectAttempts = 0;
 
-let patrolStepTimer = null;
+let patrolStepTimer = null;   // timeouts (not intervals)
 let patrolTurnTimer = null;
 let chatTimer = null;
 
@@ -58,12 +65,25 @@ let chatTimer = null;
 let pos = { x: 0, y: 64, z: 0, pitch: 0, yaw: 0 };
 let spawnPos = null;
 
+/* ---------------- HELPERS ---------------- */
+function currentVersion() {
+  return MC_VERSIONS[tryingIndex] || MC_VERSIONS[0];
+}
+
+function safeClearTimeout(t) {
+  try { if (t) clearTimeout(t); } catch (e) {}
+}
+
 function safeCloseClient() {
   stopHumanBehavior();
 
   if (keepAliveTimer) {
     clearInterval(keepAliveTimer);
     keepAliveTimer = null;
+  }
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
   if (client) {
     try { client.removeAllListeners && client.removeAllListeners(); } catch (e) {}
@@ -89,126 +109,92 @@ process.on('unhandledRejection', (reason) => {
 process.on('SIGTERM', () => shutdown(0));
 process.on('SIGINT', () => shutdown(0));
 
-function currentVersion() {
-  return MC_VERSIONS[tryingIndex] || MC_VERSIONS[0];
-}
-
+/* ---------------- RECONNECT / VERSION ROTATION ---------------- */
 function scheduleReconnect(delay = RECONNECT_DELAY_MS) {
   if (reconnectTimer) return;
-  console.log(`Reconnecting in ${delay} ms (${Math.round(delay / 1000)}s)...`);
+  reconnectAttempts = Math.min(reconnectAttempts + 1, 1000);
+  // Exponential-ish backoff: base + attempts*5s, cap 5 minutes
+  const dynamic = Math.min(delay + reconnectAttempts * 5000, 300000);
+  console.log(`Scheduling reconnect in ${dynamic} ms (attempt ${reconnectAttempts})`);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectWithCurrentVersion();
-  }, delay);
+  }, dynamic);
 }
 
 function rotateVersionAndReconnect(reason) {
   console.warn(`Rotating protocol version due to: ${reason}`);
   tryingIndex = (tryingIndex + 1) % MC_VERSIONS.length;
   const didFullCycle = tryingIndex === 0;
+  // if did full cycle, wait a bit longer
   scheduleReconnect(didFullCycle ? RECONNECT_DELAY_MS * 2 : 1000);
 }
 
-function getRuntimeId() {
+/* ---------------- RUNTIME ID helpers (BigInt-safe) ---------------- */
+function getRuntimeIdRaw() {
   if (!client) return null;
-  return client.entityId ?? client.entity?.runtime_id ?? client.startGameData?.runtime_entity_id ?? null;
+  // Try multiple places where runtime id may exist
+  return client.entity?.runtime_id ?? client.startGameData?.runtime_entity_id ?? client.entityId ?? null;
+}
+function getRuntimeId() {
+  const id = getRuntimeIdRaw();
+  if (id === null || typeof id === 'undefined') return null;
+  try {
+    if (typeof id === 'bigint') return id;
+    // Some versions return string or number - coerce to BigInt safely
+    if (typeof id === 'string') return BigInt(id);
+    if (typeof id === 'number') return BigInt(Math.floor(id));
+    // fallback
+    return BigInt(id);
+  } catch (e) {
+    console.warn('getRuntimeId: cannot convert id to BigInt:', id, e?.message);
+    return null;
+  }
 }
 
+/* ---------------- SEND PACKETS (with strict types) ---------------- */
 function sendMove(newPos) {
   const rid = getRuntimeId();
-  if (!rid) return;
+  if (!rid) {
+    // runtime id not ready yet
+    // console.debug('sendMove: no runtime id');
+    return;
+  }
 
-  pos.x = newPos.x;
-  pos.y = newPos.y;
-  pos.z = newPos.z;
-  pos.pitch = newPos.pitch ?? pos.pitch;
-  pos.yaw = newPos.yaw ?? pos.yaw;
+  // Normalize numbers
+  pos.x = Number(newPos.x ?? pos.x);
+  pos.y = Number(newPos.y ?? pos.y);
+  pos.z = Number(newPos.z ?? pos.z);
+  pos.pitch = Number(newPos.pitch ?? pos.pitch);
+  pos.yaw = Number(newPos.yaw ?? pos.yaw);
 
   try {
     client.queue('move_player', {
       runtime_id: rid,
-      position: { x: pos.x, y: pos.y, z: pos.z },
-      pitch: pos.pitch,
-      yaw: pos.yaw,
-      head_yaw: pos.yaw,
+      position: { x: Number(pos.x), y: Number(pos.y), z: Number(pos.z) },
+      pitch: Number(pos.pitch),
+      yaw: Number(pos.yaw),
+      head_yaw: Number(pos.yaw),
       mode: 0,
       on_ground: true,
-      ridden_runtime_id: 0
+      // must be BigInt
+      ridden_runtime_id: BigInt(0)
     });
   } catch (e) {
-    console.warn('sendMove error:', e?.message);
+    console.warn('sendMove error:', e?.message || e);
   }
 }
 
-function dist3(a, b) {
-  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
-}
-
-function patrolStep() {
-  if (!client || !getRuntimeId()) return;
-
-  const base = spawnPos ?? pos;
-  const d = dist3(pos, base);
-  if (d >= MAX_PATROL_DISTANCE) {
-    const dir = {
-      x: (base.x - pos.x) / d,
-      z: (base.z - pos.z) / d
-    };
-    const next = {
-      x: pos.x + dir.x * 0.8,
-      y: pos.y,
-      z: pos.z + dir.z * 0.8,
-      pitch: pos.pitch,
-      yaw: Math.atan2(-dir.x, dir.z) * (180 / Math.PI)
-    };
-    sendMove(next);
-    return;
-  }
-
-  const step = 1 + Math.floor(Math.random() * 2);
-  const angle = (pos.yaw || Math.random() * 360) * (Math.PI / 180);
-  const dirs = [
-    { dx: Math.sin(angle), dz: Math.cos(angle) },
-    { dx: -Math.sin(angle), dz: -Math.cos(angle) },
-    { dx: Math.cos(angle), dz: -Math.sin(angle) },
-    { dx: -Math.cos(angle), dz: Math.sin(angle) }
-  ];
-  const dirVec = dirs[Math.floor(Math.random() * dirs.length)];
-  const next = {
-    x: pos.x + dirVec.dx * step,
-    y: pos.y,
-    z: pos.z + dirVec.dz * step,
-    pitch: pos.pitch,
-    yaw: Math.atan2(-dirVec.dx, dirVec.dz) * (180 / Math.PI)
-  };
-
-  if (dist3(next, base) > MAX_PATROL_DISTANCE) return;
-
-  sendMove(next);
-}
-
-function patrolTurn() {
-  if (!client || !getRuntimeId()) return;
-
-  const yaw = Math.random() * 360;
-  const pitch = (Math.random() * 20) - 10;
-
-  pos.yaw = yaw;
-  pos.pitch = pitch;
-
+function sendJump() {
+  const rid = getRuntimeId();
+  if (!rid) return;
   try {
-    client.queue('move_player', {
-      runtime_id: getRuntimeId(),
-      position: { x: pos.x, y: pos.y, z: pos.z },
-      pitch,
-      yaw,
-      head_yaw: yaw,
-      mode: 0,
-      on_ground: true,
-      ridden_runtime_id: 0
+    client.queue('animate', {
+      action_id: 1,
+      runtime_id: rid
     });
   } catch (e) {
-    console.warn('patrolTurn error:', e?.message);
+    console.warn('sendJump error:', e?.message || e);
   }
 }
 
@@ -219,64 +205,174 @@ function sendChat(msg) {
       type: 'chat',
       needs_translation: false,
       source_name: BOT_NAME,
-      message: msg,
+      message: String(msg),
       xuid: '',
       platform_chat_id: '',
       filtered_message: ''
     });
     console.log(`[chat] ${BOT_NAME}: ${msg}`);
   } catch (e) {
-    console.warn('sendChat error:', e?.message);
+    console.warn('sendChat error:', e?.message || e);
   }
 }
 
-function sendJump() {
-  if (!client || !getRuntimeId()) return;
-  try {
-    client.queue('animate', {
-      action_id: 1,
-      runtime_id: getRuntimeId()
-    });
-  } catch (e) {}
+/* ---------------- PATROL LOGIC ---------------- */
+function dist3(a, b) {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
 }
 
+function chooseStepDirection() {
+  // produce a small direction unit vector based on current yaw (or random)
+  const yawDeg = (typeof pos.yaw === 'number' && !Number.isNaN(pos.yaw)) ? pos.yaw : (Math.random() * 360);
+  const angle = yawDeg * (Math.PI / 180);
+  const choices = [
+    { dx: Math.sin(angle), dz: Math.cos(angle) },
+    { dx: -Math.sin(angle), dz: -Math.cos(angle) },
+    { dx: Math.cos(angle), dz: -Math.sin(angle) },
+    { dx: -Math.cos(angle), dz: Math.sin(angle) }
+  ];
+  return choices[Math.floor(Math.random() * choices.length)];
+}
+
+function patrolStepOnce() {
+  try {
+    if (!client || !getRuntimeId()) return;
+
+    const base = spawnPos ?? pos;
+    const d = dist3(pos, base);
+    if (d >= MAX_PATROL_DISTANCE && d > 0) {
+      // move back toward base
+      const dir = { x: (base.x - pos.x) / d, z: (base.z - pos.z) / d };
+      const next = {
+        x: pos.x + dir.x * 0.8,
+        y: pos.y,
+        z: pos.z + dir.z * 0.8,
+        pitch: pos.pitch,
+        yaw: Math.atan2(-dir.x, dir.z) * (180 / Math.PI)
+      };
+      sendMove(next);
+      return;
+    }
+
+    const step = 1 + Math.floor(Math.random() * 2); // 1 or 2
+    const dirVec = chooseStepDirection();
+    const next = {
+      x: pos.x + dirVec.dx * step,
+      y: pos.y,
+      z: pos.z + dirVec.dz * step,
+      pitch: pos.pitch,
+      yaw: Math.atan2(-dirVec.dx, dirVec.dz) * (180 / Math.PI)
+    };
+
+    if (dist3(next, base) > MAX_PATROL_DISTANCE) {
+      // skip step that would go out of allowed area
+      return;
+    }
+
+    sendMove(next);
+  } catch (e) {
+    console.warn('patrolStepOnce error:', e?.message || e);
+  }
+}
+
+function scheduleNextPatrolStep() {
+  safeClearTimeout(patrolStepTimer);
+  const ms = (PATROL_STEP_SEC_MIN + Math.random() * (PATROL_STEP_SEC_MAX - PATROL_STEP_SEC_MIN)) * 1000;
+  patrolStepTimer = setTimeout(() => {
+    patrolStepOnce();
+    scheduleNextPatrolStep();
+  }, ms);
+}
+
+function patrolTurnOnce() {
+  try {
+    if (!client || !getRuntimeId()) return;
+    const yaw = Math.random() * 360;
+    const pitch = (Math.random() * 20) - 10;
+    pos.yaw = Number(yaw);
+    pos.pitch = Number(pitch);
+    // send a move packet with same pos but new head orientation
+    const rid = getRuntimeId();
+    try {
+      client.queue('move_player', {
+        runtime_id: rid,
+        position: { x: Number(pos.x), y: Number(pos.y), z: Number(pos.z) },
+        pitch: Number(pos.pitch),
+        yaw: Number(pos.yaw),
+        head_yaw: Number(pos.yaw),
+        mode: 0,
+        on_ground: true,
+        ridden_runtime_id: BigInt(0)
+      });
+    } catch (e) {
+      console.warn('patrolTurn send error:', e?.message || e);
+    }
+  } catch (e) {
+    console.warn('patrolTurnOnce error:', e?.message || e);
+  }
+}
+
+function scheduleNextPatrolTurn() {
+  safeClearTimeout(patrolTurnTimer);
+  const ms = (PATROL_TURN_SEC_MIN + Math.random() * (PATROL_TURN_SEC_MAX - PATROL_TURN_SEC_MIN)) * 1000;
+  patrolTurnTimer = setTimeout(() => {
+    patrolTurnOnce();
+    scheduleNextPatrolTurn();
+  }, ms);
+}
+
+/* ---------------- HUMAN BEHAVIOR START / STOP ---------------- */
 function startHumanBehavior() {
   if (!client) return;
 
+  // Try to seed position from startGameData (if available)
   if (client.startGameData) {
     const sg = client.startGameData;
     const p = sg.position ?? sg.player_position ?? sg.spawn_position ?? (typeof sg.x === 'number' ? { x: sg.x, y: sg.y ?? 64, z: sg.z } : null);
     if (p && typeof p.x === 'number') {
-      pos.x = p.x;
-      pos.y = p.y ?? pos.y;
-      pos.z = p.z;
-      if (!spawnPos) spawnPos = { ...pos };
+      pos.x = Number(p.x);
+      pos.y = Number(p.y ?? pos.y);
+      pos.z = Number(p.z);
+      if (!spawnPos) spawnPos = { x: pos.x, y: pos.y, z: pos.z };
     }
   }
   if (!spawnPos) spawnPos = { x: pos.x, y: pos.y, z: pos.z };
 
   console.log('Human simulation started (patrol + chat). spawnPos:', spawnPos);
 
-  const stepMs = (PATROL_STEP_SEC_MIN + Math.random() * (PATROL_STEP_SEC_MAX - PATROL_STEP_SEC_MIN)) * 1000;
-  const turnMs = (PATROL_TURN_SEC_MIN + Math.random() * (PATROL_TURN_SEC_MAX - PATROL_TURN_SEC_MIN)) * 1000;
+  // Reset reconnect attempts on success
+  reconnectAttempts = 0;
 
-  patrolStepTimer = setInterval(patrolStep, stepMs);
-  patrolTurnTimer = setInterval(patrolTurn, turnMs);
+  // schedule first run
+  scheduleNextPatrolStep();
+  scheduleNextPatrolTurn();
 
-  chatTimer = setInterval(() => {
-    if (!client || !getRuntimeId()) return;
-    const msg = CHAT_MESSAGES[Math.floor(Math.random() * CHAT_MESSAGES.length)];
-    sendChat(msg);
-    if (Math.random() < 0.3) sendJump();
+  // chat timer
+  safeClearTimeout(chatTimer);
+  chatTimer = setTimeout(function chatLoop() {
+    try {
+      if (!client || !getRuntimeId()) return;
+      const msg = CHAT_MESSAGES[Math.floor(Math.random() * CHAT_MESSAGES.length)];
+      sendChat(msg);
+      if (Math.random() < 0.3) sendJump();
+    } catch (e) {
+      console.warn('chatLoop error:', e?.message || e);
+    } finally {
+      chatTimer = setTimeout(chatLoop, CHAT_INTERVAL_MS + Math.floor(Math.random() * 30000));
+    }
   }, CHAT_INTERVAL_MS);
 }
 
 function stopHumanBehavior() {
-  if (patrolStepTimer) { clearInterval(patrolStepTimer); patrolStepTimer = null; }
-  if (patrolTurnTimer) { clearInterval(patrolTurnTimer); patrolTurnTimer = null; }
-  if (chatTimer) { clearInterval(chatTimer); chatTimer = null; }
+  safeClearTimeout(patrolStepTimer);
+  safeClearTimeout(patrolTurnTimer);
+  safeClearTimeout(chatTimer);
+  patrolStepTimer = null;
+  patrolTurnTimer = null;
+  chatTimer = null;
 }
 
+/* ---------------- CONNECT / EVENTS ---------------- */
 function connectWithCurrentVersion() {
   safeCloseClient();
   const version = currentVersion();
@@ -297,12 +393,13 @@ function connectWithCurrentVersion() {
     return;
   }
 
+  // get initial position from start_game packet
   client.on('start_game', (pkt) => {
     const p = pkt.position ?? pkt.player_position ?? pkt.spawn_position ?? (typeof pkt.x === 'number' ? { x: pkt.x, y: pkt.y ?? 64, z: pkt.z } : null);
     if (p && typeof p.x === 'number') {
-      pos.x = p.x;
-      pos.y = p.y ?? pos.y;
-      pos.z = p.z;
+      pos.x = Number(p.x);
+      pos.y = Number(p.y ?? pos.y);
+      pos.z = Number(p.z);
       if (!spawnPos) spawnPos = { x: pos.x, y: pos.y, z: pos.z };
     }
   });
@@ -339,6 +436,7 @@ function connectWithCurrentVersion() {
       return;
     }
 
+    // any other errors -> retry with backoff
     safeCloseClient();
     if (RECONNECT_MODE === 'exit') return shutdown(1);
     scheduleReconnect(RECONNECT_DELAY_MS);
@@ -354,23 +452,28 @@ function connectWithCurrentVersion() {
       return;
     }
 
+    // server requested disconnect (bad_packet, kicked, stop) -> schedule reconnect
     safeCloseClient();
     if (RECONNECT_MODE === 'exit') return shutdown(1);
     scheduleReconnect(RECONNECT_DELAY_MS);
   });
 
   client.on('end', () => {
+    console.warn('Connection ended by server.');
     safeCloseClient();
     if (RECONNECT_MODE === 'exit') return shutdown(1);
     scheduleReconnect(RECONNECT_DELAY_MS);
   });
 
   client.on('close', () => {
+    console.warn('Socket closed.');
     safeCloseClient();
     if (RECONNECT_MODE === 'exit') return shutdown(1);
     scheduleReconnect(RECONNECT_DELAY_MS);
   });
 }
 
+/* ---------------- START ---------------- */
 tryingIndex = 0;
+console.log('BOT_NAME =', BOT_NAME);
 connectWithCurrentVersion();
